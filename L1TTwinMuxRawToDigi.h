@@ -20,8 +20,9 @@
 #include "DataFormats/L1DTTrackFinder/interface/L1MuDTChambThContainer.h"
 #include "DataFormats/L1DTTrackFinder/interface/L1MuDTTrackContainer.h"
 #include "DataFormats/HcalDigi/interface/HOTriggerPrimitiveDigi.h"
-#include "EventFilter/L1TXRawToDigi/plugins/HOTPUnpacker.h"
-
+#include "DataFormats/HcalDigi/interface/HcalUnpackerReport.h"
+//#include "EventFilter/L1TXRawToDigi/plugins/HOTPUnpacker.h"
+#include "CondFormats/HcalObjects/interface/HcalElectronicsMap.h"
 #include <DataFormats/FEDRawData/interface/FEDRawDataCollection.h>
 #include <FWCore/Framework/interface/EDProducer.h>
 #include <FWCore/ParameterSet/interface/ParameterSet.h>
@@ -44,14 +45,22 @@ public:
 
   /// HO TP collection
   std::vector<HOTriggerPrimitiveDigi>* tphoCont;
-  const HcalElectronicsMap* readoutMap;
+  //  const HcalElectronicsMap* readoutMap;
   std::auto_ptr<HcalUnpackerReport> report;
+
+  struct Collections {
+    Collections();
+    std::vector<HOTriggerPrimitiveDigi>* tphoCont;
+  };
+
+  bool dodebug = true;
 
   /// Generate and fill FED raw data for a full event
   bool fillRawData( edm::Event& e,
 		    L1MuDTChambPhContainer::Phi_Container& phi_data,
 		    L1MuDTChambThContainer::The_Container& the_data,
-		    HOTPUnpacker::Collections& colls
+		    Collections& colls,
+		    const HcalElectronicsMap* readutMap
 );
 
   void processFed( int twinmuxfed, 
@@ -61,7 +70,10 @@ public:
 		   edm::Handle<FEDRawDataCollection> data,
 		   L1MuDTChambPhContainer::Phi_Container& phi_data,
 		   L1MuDTChambThContainer::The_Container& the_data,
-		   HOTPUnpacker::Collections& colls);
+		   Collections& colls,
+		   const HcalElectronicsMap* readutMap);
+
+
 
 private:
   
@@ -94,13 +106,14 @@ private:
   int benAngConversion( int benAng_  );
 
   // HO unpack
-  HOTPUnpacker hounpacker_;
+  //  HOTPUnpacker hounpacker_;
   std::vector<int> hofedUnpackList_;
   int hofirstFED_;
   bool silent_, complainEmptyData_;
-  struct HOUnrolledTP;
+  int mode_ = 0;
+  int sourceIdOffset_;
+  bool silent;
+  //  struct HOUnrolledTP;
 };
-
-
 
 #endif

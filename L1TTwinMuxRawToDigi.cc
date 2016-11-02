@@ -20,6 +20,9 @@
 #include "FWCore/MessageLogger/interface/MessageLogger.h"
 #include "DataFormats/FEDRawData/interface/FEDNumbering.h"
 #include "DataFormats/HcalDigi/interface/HcalDigiCollections.h"
+#include "EventFilter/HcalRawToDigi/interface/HcalDCCHeader.h"
+#include "EventFilter/HcalRawToDigi/interface/HcalHTRData.h"
+#include "EventFilter/HcalRawToDigi/interface/HcalDTCHeader.h" 
 #include "FWCore/Framework/interface/ESHandle.h" 
 #include "CalibFormats/HcalObjects/interface/HcalDbService.h"
 #include "CalibFormats/HcalObjects/interface/HcalDbRecord.h"
@@ -34,7 +37,7 @@ L1TTwinMuxRawToDigi::L1TTwinMuxRawToDigi(const edm::ParameterSet& pset) :
   feds_( pset.getUntrackedParameter<std::vector<int> >("feds", std::vector<int>()) ),
   wheels_( pset.getUntrackedParameter<std::vector<int> >("wheels", std::vector<int>())),
   amcsecmap_( pset.getUntrackedParameter<std::vector<long long int> >("amcsecmap", std::vector<long long int>())),
-  hounpacker_(pset.getUntrackedParameter<int>("HcalFirstFED",int(FEDNumbering::MINHCALFEDID)),pset.getParameter<int>("firstSample"),pset.getParameter<int>("lastSample")),
+  //  hounpacker_(pset.getUntrackedParameter<int>("HcalFirstFED",int(FEDNumbering::MINHCALFEDID)),pset.getParameter<int>("firstSample"),pset.getParameter<int>("lastSample")),
   hofedUnpackList_(pset.getUntrackedParameter<std::vector<int> >("FEDs", std::vector<int>())),
   hofirstFED_(pset.getUntrackedParameter<int>("HcalFirstFED",FEDNumbering::MINHCALFEDID)),
   silent_(pset.getUntrackedParameter<bool>("silent",true)),
@@ -43,9 +46,11 @@ L1TTwinMuxRawToDigi::L1TTwinMuxRawToDigi(const edm::ParameterSet& pset) :
     
 
   if (hofedUnpackList_.empty()) {
-    for (int i=724; i<=FEDNumbering::MAXHCALFEDID; i++) // 724-731 are HO FEDs
+    for (int i=FEDNumbering::MINHCALFEDID; i<=FEDNumbering::MAXHCALFEDID; i++)
+      // (int i=724; i<=FEDNumbering::MAXHCALFEDID; i++) // 724-731 are HO FEDs
       hofedUnpackList_.push_back(i);
   }
+
 
   produces<L1MuDTChambPhContainer>();
   produces<L1MuDTChambThContainer>();
@@ -85,18 +90,21 @@ void L1TTwinMuxRawToDigi::produce(edm::Event& e,
   L1MuDTChambThContainer::The_Container the_data;
   //  HOTriggerPrimitiveDigi ho_data;
 
+  if(dodebug)  std::cout<<"************ Start the produce loop for event: "<< (e.eventAuxiliary().event()) << std::endl;
 
   // HO
   edm::ESHandle<HcalDbService> pSetup; 
   c.get<HcalDbRecord>().get( pSetup );
-  //  const HcalElectronicsMap* 
-  readoutMap = pSetup->getHcalMapping();
+  const HcalElectronicsMap*  readoutMap = pSetup->getHcalMapping();
+
+  if(dodebug)  std::cout<<"unpacked the hofedlist, size is :"<< hofedUnpackList_.size() << std::endl;
 
   std::vector<HOTriggerPrimitiveDigi> hotp;
-  HOTPUnpacker::Collections colls;
+  Collections colls;
   colls.tphoCont = &hotp;
 
-  if ( !fillRawData(e, phi_data, the_data, colls) ) return;
+  if(dodebug) std::cout<<"Entering in the fillRawData loop"<< std::endl;
+  if ( !fillRawData(e, phi_data, the_data, colls, readoutMap) ) return;
 
   TM7phi_product->setContainer(phi_data);
   TM7the_product->setContainer(the_data);
@@ -116,13 +124,15 @@ void L1TTwinMuxRawToDigi::produce(edm::Event& e,
 bool L1TTwinMuxRawToDigi::fillRawData( edm::Event& e,
 				       L1MuDTChambPhContainer::Phi_Container& phi_data,
 				       L1MuDTChambThContainer::The_Container& the_data,
-				       HOTPUnpacker::Collections& colls) {
-  
+				       Collections& colls,
+				       const HcalElectronicsMap *readoutMap) {
   edm::Handle<FEDRawDataCollection> data;
   e.getByToken( Raw_token, data );
 
+  if(dodebug)   std::cout<<"In fillRawData loop, will start analyzing the TMux feds, No.:"<<nfeds_<< std::endl;
   for ( size_t w_i = 0; w_i < nfeds_; ++w_i ) {
-    processFed( feds_[w_i], wheels_[w_i], amcsec_[w_i], data, phi_data, the_data, colls );
+    if(dodebug) std::cout<<"processing the FED: "<<feds_[w_i]<< std::endl;
+    processFed( feds_[w_i], wheels_[w_i], amcsec_[w_i], data, phi_data, the_data, colls, readoutMap );
   }
   
   return true;
@@ -159,14 +169,40 @@ int L1TTwinMuxRawToDigi::benAngConversion( int benAng_  ) {
     
 }
 
+
+struct HOUnrolledTP { // parts of an HO trigger primitive, unpacked                
+  bool valid, checked;
+  int ieta, iphi, samples, soi;
+  unsigned int databits;
+  HOUnrolledTP() {
+    valid=false;
+    checked=false;
+    ieta=0;
+    iphi=0;
+    samples=0;
+    soi=0;
+    databits=0;
+  }
+  void setbit(int i) { databits|=(1<<i); }
+};
+
+static int slbChan(uint16_t theSample) { return (theSample>>11)&0x3; }
+
+                                                                                                                             
+static inline bool isTPGSOI(const HcalTriggerPrimitiveSample& s) {
+  return (s.raw()&0x200)!=0;
+}
+
 void L1TTwinMuxRawToDigi::processFed( int twinMuxFed, 
 				      int twinMuxWheel,
 				      std::array<short, 12> twinMuxAmcSec,
 				      edm::Handle<FEDRawDataCollection> data,
 				      L1MuDTChambPhContainer::Phi_Container& phiSegments,
 				      L1MuDTChambThContainer::The_Container& theSegments,
-				      HOTPUnpacker::Collections& colls) {
+				      Collections& colls,
+				      const HcalElectronicsMap* readoutMap) {
   
+  if(dodebug)  std::cout<<"In processFed loop"<< std::endl;
   /// Container
   std::vector<long> DTTM7WordContainer;
 
@@ -179,8 +215,11 @@ void L1TTwinMuxRawToDigi::processFed( int twinMuxFed,
   }
 
   /// Header
+  if(dodebug)  std::cout<<"checking if there is TMdata?"<<std::endl;
   FEDRawData TM7data = data->FEDData(twinMuxFed); 
   if ( TM7data.size() == 0 ) return;
+
+  if(dodebug) std::cout<<"TM7data has data!"<<std::endl;
 
   /// Variables
   LineFED_ = TM7data.data();
@@ -191,6 +230,11 @@ void L1TTwinMuxRawToDigi::processFed( int twinMuxFed,
   ///--> Header - line 1 [must start with 0x5]
   readline( nline, dataWord );
   calcCRC( dataWord, newCRC );
+  
+  std::cout<<"dataWord : "<< dataWord<<std::endl;
+  std::cout<<"dataWord >> 8: "<< (dataWord >> 8) <<std::endl;
+  std::cout<<"dataWord >> 8) & 0xfff: "<< ((dataWord >> 8) & 0xFFF) <<std::endl;
+
 
   int TM7fedId = ( dataWord >> 8 ) & 0xFFF;  // positions 8 -> 19
   /*** NOT UNPACKED  
@@ -273,7 +317,6 @@ void L1TTwinMuxRawToDigi::processFed( int twinMuxFed,
   calcCRC( dataWord, newCRC);
 
   ///--> Trailer - line 2 [must start with 0xA]
-
   readline( nline, dataWord );
   calcCRC( dataWord & 0xFFFFFFFF0000FFFF, newCRC); /// needed not to put crc in crc calc
 
@@ -308,6 +351,8 @@ void L1TTwinMuxRawToDigi::processFed( int twinMuxFed,
   std::vector<long>::iterator DTTM7iterator = DTTM7WordContainer.begin();
   std::vector<long>::iterator DTTM7itend = DTTM7WordContainer.end();
 
+  if(dodebug) std::cout<<"will analyze the DTTM7 word!"<<std::endl;
+
   int lcounter = 0;
   for ( ; DTTM7iterator != DTTM7itend; ++DTTM7iterator ) {
   
@@ -327,7 +372,8 @@ void L1TTwinMuxRawToDigi::processFed( int twinMuxFed,
     }
     
     int sector     = twinMuxAmcSec[AMC_ID-1];
-    
+    if(dodebug) std::cout<<"sector analysed is "<<sector<<std::endl;   
+ 
     if( ( sector < 1 ) or ( sector > 12 ) ) {
       if( sector != 15 ) edm::LogWarning("TwinMux_unpacker") << "%%%%%% VALID AMC_ID POINTS TO SECTOR OUT OF RANGE \n"
                                                              << " TM7fedId "     << TM7fedId
@@ -346,7 +392,9 @@ void L1TTwinMuxRawToDigi::processFed( int twinMuxFed,
                           << "dataLenght " << dataLenght << '\n';
 
     ++DTTM7iterator; // User word empty  /// ==>> increment 2
-    if( DTTM7iterator == DTTM7itend ) {
+
+    
+if( DTTM7iterator == DTTM7itend ) {
       edm::LogInfo("TwinMux_unpacker") << "TRAILING WORD AS A PAYLOAD END in FED " 
                                        << std::hex << TM7fedId 
                                        << std::hex << dataWord 
@@ -355,6 +403,8 @@ void L1TTwinMuxRawToDigi::processFed( int twinMuxFed,
       break;
     }
   
+    if(dodebug) std::cout<<"clear the test:01"<<std::endl;    
+
     dataWord = (*DTTM7iterator);
     int boardID   = (dataWord & 0xFFFF); // positions  0 -> 15
     int orbit     = (dataWord >> 16 ) & 0xFFFF; // positions 15 -> 32
@@ -371,6 +421,8 @@ void L1TTwinMuxRawToDigi::processFed( int twinMuxFed,
                                           << " it pos "       << int(DTTM7iterator - DTTM7itend);
       break;
     }
+
+    if(dodebug) std::cout<<"clear the test:02"<<std::endl;    
 
     if (debug_ ) logfile << '[' << ++lcounter << "]\t" 
                          << std::hex << dataWord 
@@ -395,15 +447,19 @@ void L1TTwinMuxRawToDigi::processFed( int twinMuxFed,
         
       }
 
+      if(dodebug) std::cout<<"clear the test:03"<<std::endl;    
+      
       long dataWordSub = (*DTTM7iterator);
       int selector = ( dataWordSub >> 60 ) & 0xF; // positions 60 -> 63
 
-      if ( selector == 0x4 ) { //TSC word
+      if(dodebug) std::cout<<"selector is :"<< selector << std::endl;
 
+      if ( selector == 0x4 ) { //TSC word
+	
         bxID = ( dataWordSub >> 48 ) & 0xFFF; // positions 48 -> 60
         bc0  = ( dataWordSub >> 22 ) & 0x1; // positions 22 -> 23
         bxNr = normBx(bxID, bxCounter); /// bx normalized to the bxcounter
-		
+	
         if ( debug_ ) logfile << '[' << ++lcounter << "]\t" << std::hex 
                               << dataWordSub << std::dec
                               << "\t TSC WORD\t"
@@ -413,7 +469,8 @@ void L1TTwinMuxRawToDigi::processFed( int twinMuxFed,
       }//TSC WORD
     
       else if ( selector == 0x1 ) { //MB1/2 word
- 
+	std::cout<<"dataWordSub : "<< dataWordSub << std::endl;
+
         int mb2_phi =    ( dataWordSub & 0xFFF);        // positions  0 -> 11
         int mb2_phib =   ( dataWordSub >> 12 ) & 0x3FF; // positions 12 -> 21
         int mb2_qual =   ( dataWordSub >> 22 ) & 0x7;   // positions 22 -> 24
@@ -674,76 +731,251 @@ void L1TTwinMuxRawToDigi::processFed( int twinMuxFed,
 	
         edm::LogInfo("TwinMux_unpacker") << "HO WORD [" << std::dec << tm7eventsize << "] : "
                                          << std::hex << dataWordSub << std::dec
-                                         << " it pos " << int(DTTM7iterator - DTTM7itend);
+                                         << "1 it pos " << int(DTTM7iterator - DTTM7itend);
 	
         if ( debug_ ) logfile << '[' << ++lcounter << "]\t" << std::hex 
                               << dataWordSub << std::dec
                               << "\t HO WORD\n";          
+
+
+        if(dodebug) std::cout<<"TwinMux_unpacker::HO WORD [" << std::dec << tm7eventsize << "] : "
+                                         << std::hex << dataWordSub <<  " it pos " << int(DTTM7iterator - DTTM7itend)<<std::endl;
+	
+        if ( dodebug ) std::cout << '[' << ++lcounter << "]\t" << std::hex 
+                              << dataWordSub << std::dec
+                              << "\t HO WORD\n";          
+	
+	
+
 	
 	std::ostringstream ss;
 	for (unsigned int i=0; i<hofedUnpackList_.size(); i++)
 	  ss << hofedUnpackList_[i] << " ";
 	edm::LogInfo("HO") << "HO TP will unpack FEDs ( " << ss.str() << ")";
+
+	if(dodebug) std::cout<<"HO TP will unpack FEDs ( " << ss.str() << ")"<<std::endl;	
+
+
+	int top_mip =   ( dataWordSub >> 23 );          // positions  0 -> 23
+        // int bot_mip =   ( dataWordSub >> 29 ) & 0xFF;   // positions 29 -> 52
+        //int top_bx  =   ( dataWordSub >> 24 ) & 0xFF;   // positions 24 -> 27
+        //int bot_bx  =   ( dataWordSub >> 53 ) & 0xFF;   // positions 53 -> 56
 	
-        int top_mip =   ( dataWordSub >> 23 );          // positions  0 -> 23
-        int top_bx  =   ( dataWordSub >> 24 ) & 0xFF;   // positions 24 -> 27
-        int bot_mip =   ( dataWordSub >> 29 ) & 0xFF;   // positions 29 -> 52
-        int bot_bx  =   ( dataWordSub >> 53 ) & 0xFF;   // positions 53 -> 56
-	
+	std::cout<<"mip is : "<< top_mip<<std::endl;
+
 	// unpack all HO FEDs                                       
 	HOUnrolledTP unrolled[24];
+
 	for (std::vector<int>::const_iterator i=hofedUnpackList_.begin(); i!=hofedUnpackList_.end(); i++) {
 	  const FEDRawData& fed = data->FEDData(*i);
+	  if(dodebug)	  std::cout<<"fed.size() "<< fed.size() << std::endl;
 	  if (fed.size()==0) {
 	    if (complainEmptyData_) {
 	      if (!silent_) edm::LogWarning("EmptyData") << "No data for FED " << *i;
-	      report->addError(*i);
+	      if(dodebug) std::cout<<"Empty data for fed"<<*i << std::endl;
+	      //	      report->addError(*i);
 	    }
 	  } else if (fed.size() < 8*3) {
 	    if (!silent_) edm::LogWarning("EmptyData") << "Tiny data " << fed.size() << " for FED " << *i;
-	    report->addError(*i);
+	    //	    report->addError(*i);
 	  } else {
 	    try {
-	      unpack(fed, *readoutMap, colls, *report, silent_);
-	      report->addUnpacked(*i);
+
+	      //main code begin here
+	      // get the DCC header
+	      const HcalDCCHeader* dccHeader=(const HcalDCCHeader*)(fed.data());
+	      const HcalDTCHeader* dtcHeader=(const HcalDTCHeader*)(fed.data());
+	      bool is_VME_DCC=(dccHeader->getDCCDataFormatVersion()<0x10) || ((mode_&0x1)==0);
+	      
+	      int dccid=(is_VME_DCC)?(dccHeader->getSourceId()-sourceIdOffset_):(dtcHeader->getSourceId()-sourceIdOffset_);
+	      if(dodebug) std::cout<<"********************** dccid is :"<< dccid<< std::endl;
+
+	      // check the summary status
+	      
+	      // walk through the HTR data.  For the uTCA, use spigot=slot+1
+	      HcalHTRData htr;
+	      const unsigned short* daq_first, *daq_last, *tp_first, *tp_last;
+	      //  const HcalQIESample* qie_begin, *qie_end, *qie_work;
+	      const HcalTriggerPrimitiveSample *tp_begin, *tp_end, *tp_work; 
+	      for (int spigot=0; spigot<HcalDCCHeader::SPIGOT_COUNT; spigot++) {
+		if(dodebug)		std::cout<<"spigot is :"<< spigot << std::endl;
+
+		if (is_VME_DCC) {
+		  if (!dccHeader->getSpigotPresent(spigot)) continue;
+		  
+		  int retval=dccHeader->getSpigotData(spigot,htr,fed.size());
+		  if (retval!=0) {
+		    if (retval==-1) {
+		      if (!silent) edm::LogWarning("Invalid Data") << "Invalid HTR data (data beyond payload size) observed on spigot " << spigot << " of DCC with source id " << dccHeader->getSourceId();
+		      //		      report.countSpigotFormatError();
+		    }
+		    continue;
+		  }
+		  // check
+		  if (dccHeader->getSpigotCRCError(spigot)) {
+		    if (!silent) 
+		      edm::LogWarning("Invalid Data") << "CRC Error on HTR data observed on spigot " << spigot << " of DCC with source id " << dccHeader->getSourceId();
+		    //		    report.countSpigotFormatError();
+		    continue;
+		  } 
+		} else { // is_uTCA (!is_VME_DCC)
+		  int slot=spigot+1;
+		  if (slot>HcalDTCHeader::MAXIMUM_SLOT) continue;
+		  
+		  if (!dtcHeader->getSlotPresent(slot)) continue;
+		  
+		  int retval=dtcHeader->getSlotData(slot,htr,fed.size());
+		  if (retval!=0) {
+		    if (retval==-1) {
+		      if (!silent) edm::LogWarning("Invalid Data") << "Invalid uHTR data (data beyond payload size) observed on slot " << slot << " of DTC with source id " << dtcHeader->getSourceId();
+		      //		      report.countSpigotFormatError();
+		    }
+		    continue;
+		  }
+		  
+		  // check
+		  if (dtcHeader->getSlotCRCError(slot)) {
+		    if (!silent) 
+		      edm::LogWarning("Invalid Data") << "CRC Error on uHTR data observed on slot " << slot << " of DTC with source id " << dtcHeader->getSourceId();
+		    //		    report.countSpigotFormatError();
+		    continue;
+		  } 
+		}
+		
+		
+		// check for EE
+		if (htr.isEmptyEvent()) {
+		  //		  report.countEmptyEventSpigot();
+		}
+		if (htr.isOverflowWarning()) {
+		  //		  report.countOFWSpigot();
+		}
+		if (htr.isBusy()) {
+		  //		  report.countBusySpigot();
+		}
+		if (!htr.check()) {
+		  if (!silent) 
+		    edm::LogWarning("Invalid Data") << "Invalid HTR data observed on spigot " << spigot << " of DCC with source id " << dccHeader->getSourceId();
+		  //		  report.countSpigotFormatError();
+		  continue;
+		}  
+		
+		if (htr.getFirmwareFlavor()>=0x80) {
+		  if (!silent) edm::LogWarning("HOTPUnpacker") << "Skipping data on spigot " << spigot << " of DCC with source id " << dccHeader->getSourceId() << " which is of unknown flavor " << htr.getFirmwareFlavor();
+		  continue;
+		}
+		
+		// calculate "real" number of presamples
+		// int nps=htr.getNPS()-startSample_;
+		
+		// get pointers
+		htr.dataPointers(&daq_first,&daq_last,&tp_first,&tp_last);
+		unsigned int smid = htr.getSubmodule();
+		int htr_tb=smid&0x1;
+		int htr_slot=(smid>>1)&0x1F;
+		int htr_cr=(smid>>6)&0x1F;
+		
+		tp_begin=(HcalTriggerPrimitiveSample*)tp_first;
+		tp_end=(HcalTriggerPrimitiveSample*)(tp_last+1); // one beyond last..
+		
+		/// work through the samples
+		//    int currFiberChan=0x3F; // invalid fiber+channel...
+		// int ncurr=0;
+		// bool valid=false;
+		
+		//    bool tpgSOIbitInUse=htr.getFormatVersion()>=3; // version 3 and later
+		bool isHOtpg=htr.getFormatVersion()>=3 && htr.getFirmwareFlavor()==0; // HO is flavor zero
+		
+		
+		/*
+		  Unpack the trigger primitives
+		*/
+		if (isHOtpg) {
+		  if(dodebug) std::cout <<"hotp is being obserbed, will unpack"<< std::endl;
+
+		  for (tp_work=tp_begin; tp_work!=tp_end; tp_work++) {
+		    if (tp_work->raw()==0xFFFF) continue; // filler word
+		    //int sector=tp_work->slbChan();
+		    int sector=slbChan(tp_work->raw());
+		    if(dodebug)	 std::cout<<"sector for the HO is: " << sector << std::endl;
+
+		    if (sector>2) continue;
+		    
+		    for (int ibit=0; ibit<8; ibit++) {
+		      int linear=sector*8+ibit; 
+		      if (!unrolled[linear].checked) {
+			unrolled[linear].checked=true;
+			int fiber=(linear/3)+1;
+			int fc=(linear%3);
+			
+			// electronics id (use precision match for HO TP)
+			//http://cmslxr.fnal.gov/source/DataFormats/HcalDetId/interface/HcalElectronicsIdh.
+			HcalElectronicsId eid(fc,fiber,spigot,dccid);	
+			eid.setHTR(htr_cr,htr_slot,htr_tb);
+			std::cout<<"electronics Id: "<< eid() << std::endl;
+	
+			//http://cmslxr.fnal.gov/source/CondFormats/HcalObjects/interface/HcalElectronicsMap.h
+			DetId did= readoutMap->lookup(eid);
+			std::cout<<"sector: "<<sector <<" subdet : "<< ((HcalSubdetector)did.subdetId()) << " htrchan:"<<eid.htrChanId()<<" htrSlot :"<<eid.htrSlot()<< " crateId() : "<<eid.crateId()<< std::endl;
+			std::cout<<"detId :"<< did() <<" det: " << did.det()<<" subdetId : "<< did.subdetId() << std::endl;
+			
+			if (!did.null()) {
+			  if (did.det()==DetId::Hcal && ((HcalSubdetector)did.subdetId())==HcalOuter ) {
+			    HcalDetId hid(did);
+			    unrolled[linear].valid=true;
+			    unrolled[linear].ieta=hid.ieta();
+			    unrolled[linear].iphi=hid.iphi();
+			    if(dodebug)   std::cout<<"eta, phi is :"<< hid.ieta() <<"," << hid.iphi() << std::endl;
+			  }
+			}
+		      }
+		      if (unrolled[linear].valid) {
+			if (isTPGSOI(*tp_work)) unrolled[linear].soi=unrolled[linear].samples;
+			if (tp_work->raw()&(1<<ibit)) unrolled[linear].setbit(unrolled[linear].samples);
+			unrolled[linear].samples++;
+		      }
+		    } // for (int ibit=0; ibit<8; ibit++)
+		  } // for (tp_work=tp_begin; tp_work!=tp_end; tp_work++)
+		  
+		  for (int i=0; i<24; i++) {
+		    if (unrolled[i].valid) 
+		      colls.tphoCont->push_back(HOTriggerPrimitiveDigi(
+								       unrolled[i].ieta,
+								       unrolled[i].iphi,
+								       unrolled[i].samples,
+								       unrolled[i].soi,
+								       unrolled[i].databits)
+						);
+		  }
+		}
+	      }
+	      
+	      //    unpack(fed, *readoutMap, colls, *report, silent_);
+	      
+	      
+	      // main code ends here
+	      //	      report->addUnpacked(*i);
 	    } catch (cms::Exception& e) {
 	      if (!silent_) edm::LogWarning("Unpacking error") << e.what();
-	      report->addError(*i);
+	      //	      report->addError(*i);
 	    } catch (...) {
 	      if (!silent_) edm::LogWarning("Unpacking exception");
-	      report->addError(*i);
+	      //	      report->addError(*i);
 	    }
 	  }
 	} //  for (std::vector<int>::const_iterator
 	
-
-	if (unrolled[linear].valid) {
-	  if (tp_work->raw() & (1<<ibit))  unrolled[linear].setbit(unrolled[linear].samples);
-	  unrolled[linear].samples++;
-	}
 	
-	
-	for (int i=0; i<24; i++) {
-	  if (unrolled[i].valid) 
-	    tphoCont->push_back(HOTriggerPrimitiveDigi(
-						       unrolled[i].ieta,
-						       unrolled[i].iphi,
-						       unrolled[i].samples,
-						       unrolled[i].soi,
-						       unrolled[i].databits));
-	}
-	
-	
-	if ( debug_ ) logfile << '[' << ++lcounter << "]\t"<< std::hex
-			      << dataWordSub   << std::dec      << "\t|\t"
-			      << "mb3_ts2tag " << mb3_ts2tag    << '\t'
-			      << "mb3_qual "   << mb3_qual      << '\t'
-			      << "mb3_phib "   << mb3_phib_conv << '\t'
-			      << "mb3_phi "    << mb3_phi_conv  << '\t'
-			      << "mb4_ts2tag " << mb4_ts2tag    << '\t'
-			      << "mb4_qual "   << mb4_qual      << '\t'
-			      << "mb4_phib "   << mb4_phib_conv << '\t'
-			      << "mb4_phi "    << mb4_phi_conv  << '\n';
+	// if ( debug_ ) logfile << '[' << ++lcounter << "]\t"<< std::hex
+	// 		      << dataWordSub   << std::dec      << "\t|\t"
+	// 		      << "mb3_ts2tag " << mb3_ts2tag    << '\t'
+	// 		      << "mb3_qual "   << mb3_qual      << '\t'
+	// 		      << "mb3_phib "   << mb3_phib_conv << '\t'
+	// 		      << "mb3_phi "    << mb3_phi_conv  << '\t'
+	// 		      << "mb4_ts2tag " << mb4_ts2tag    << '\t'
+	// 		      << "mb4_qual "   << mb4_qual      << '\t'
+	// 		      << "mb4_phib "   << mb4_phib_conv << '\t'
+	// 		      << "mb4_phi "    << mb4_phi_conv  << '\n';
 	
 	
       }//HO word
@@ -885,166 +1117,10 @@ void L1TTwinMuxRawToDigi::calcCRC( long word, int & myC ) {
   return;
 }
 
-struct L1TTwinMuxRawToDigi::HOUnrolledTP { // parts of an HO trigger primitive, unpacked                                                                                                                                             
-  bool valid, checked;
-  int ieta, iphi, samples, soi;
-  unsigned int databits;
-  HOUnrolledTP() {
-    valid=false;
-    checked=false;
-    ieta=0;
-    iphi=0;
-    samples=0;
-    soi=0;
-    databits=0;
-  }
-  void setbit(int i) { databits|=(1<<i); }
-};
 
-
-static inline bool isTPGSOI(const HcalTriggerPrimitiveSample& s) {
-  return (s.raw()&0x200)!=0;
+L1TTwinMuxRawToDigi::Collections::Collections() {
+  tphoCont=0;
 }
-
-void L1TTwinMuxRawToDigi::unpack(const FEDRawData& raw, 
-				 const HcalElectronicsMap& emap, 
-				 HcalUnpackerReport& report, 
-				 bool silent) 
-{
-  
-  if (raw.size()<16) {
-    if (!silent) edm::LogWarning("Invalid Data") << "Empty/invalid DCC data, size = " << raw.size();
-    return;
-  }
-  
-  // get the DCC header
-  const HcalDCCHeader* dccHeader=(const HcalDCCHeader*)(raw.data());
-  const HcalDTCHeader* dtcHeader=(const HcalDTCHeader*)(raw.data());
-  bool is_VME_DCC=(dccHeader->getDCCDataFormatVersion()<0x10) || ((mode_&0x1)==0);
-  
-  int dccid=(is_VME_DCC)?(dccHeader->getSourceId()-sourceIdOffset_):(dtcHeader->getSourceId()-sourceIdOffset_);
-
-  // check the summary status
-  
-  // walk through the HTR data.  For the uTCA, use spigot=slot+1
-  HcalHTRData htr;
-  const unsigned short* daq_first, *daq_last, *tp_first, *tp_last;
-  const HcalQIESample* qie_begin, *qie_end, *qie_work;
-  const HcalTriggerPrimitiveSample *tp_begin, *tp_end, *tp_work; 
-  for (int spigot=0; spigot<HcalDCCHeader::SPIGOT_COUNT; spigot++) {
-    
-    if (is_VME_DCC) {
-      if (!dccHeader->getSpigotPresent(spigot)) continue;
-      
-      int retval=dccHeader->getSpigotData(spigot,htr,raw.size());
-      if (retval!=0) {
-	if (retval==-1) {
-	  if (!silent) edm::LogWarning("Invalid Data") << "Invalid HTR data (data beyond payload size) observed on spigot " << spigot << " of DCC with source id " << dccHeader->getSourceId();
-	  report.countSpigotFormatError();
-	}
-	continue;
-      }
-      // check
-      if (dccHeader->getSpigotCRCError(spigot)) {
-	if (!silent) 
-	  edm::LogWarning("Invalid Data") << "CRC Error on HTR data observed on spigot " << spigot << " of DCC with source id " << dccHeader->getSourceId();
-	report.countSpigotFormatError();
-	continue;
-      } 
-    } //  if (is_VME_DCC)
-    
-    
-    // check for EE
-    if (htr.isEmptyEvent()) {
-      report.countEmptyEventSpigot();
-    }
-    if (htr.isOverflowWarning()) {
-      report.countOFWSpigot();
-    }
-    if (htr.isBusy()) {
-      report.countBusySpigot();
-    }
-    if (!htr.check()) {
-      if (!silent) 
-	edm::LogWarning("Invalid Data") << "Invalid HTR data observed on spigot " << spigot << " of DCC with source id " << dccHeader->getSourceId();
-      report.countSpigotFormatError();
-      continue;
-    }  
-    if (htr.isHistogramEvent()) {
-      if (!silent) edm::LogWarning("Invalid Data") << "Histogram data passed to non-histogram unpacker on spigot " << spigot << " of DCC with source id " << dccHeader->getSourceId();
-      continue;
-    }
-  
-    if (htr.getFirmwareFlavor()>=0x80) {
-      if (!silent) edm::LogWarning("HcalUnpacker") << "Skipping data on spigot " << spigot << " of DCC with source id " << dccHeader->getSourceId() << " which is of unknown flavor " << htr.getFirmwareFlavor();
-      continue;
-    }
-    
-    // calculate "real" number of presamples
-    int nps=htr.getNPS()-startSample_;
-    
-    // get pointers
-    htr.dataPointers(&daq_first, &daq_last, &tp_first, &tp_last);
-    unsigned int smid=htr.getSubmodule();
-    int htr_tb   = smid&0x1;
-    int htr_slot = (smid>>1)&0x1F;
-    int htr_cr   = (smid>>6)&0x1F;
-    
-    tp_begin=(HcalTriggerPrimitiveSample*)tp_first;
-    tp_end=(HcalTriggerPrimitiveSample*)(tp_last+1); // one beyond last..
-    
-    /// work through the samples
-    int currFiberChan=0x3F; // invalid fiber+channel...
-    int ncurr=0;
-    bool valid=false;
-
-    bool isHOtpg = htr.getFormatVersion()>=3 && htr.getFirmwareFlavor()==0; // HO is flavor zero
-    int npre = 0;
-    /*
-      Unpack the trigger primitives
-    */
-    if (isHOtpg) {
-      //      HOUnrolledTP unrolled[24];
-      for (tp_work=tp_begin; tp_work!=tp_end; tp_work++) {
-	if (tp_work->raw()==0xFFFF) continue; // filler word
-	int sector=tp_work->slbChan();
-	if (sector>2) continue;
-
-	for (int ibit=0; ibit<8; ibit++) {
-	  int linear=sector*8+ibit; 
-	  if (!unrolled[linear].checked) {
-	    unrolled[linear].checked=true;
-	    int fiber=(linear/3)+1;
-	    int fc=(linear%3);
-	    // electronics id (use precision match for HO TP)
-	    HcalElectronicsId eid(fc,fiber,spigot,dccid);	
-	    eid.setHTR(htr_cr,htr_slot,htr_tb);
-	    DetId did=emap.lookup(eid);
-	    if (!did.null()) {
-	      if (did.det()==DetId::Hcal && ((HcalSubdetector)did.subdetId())==HcalOuter ) {
-		HcalDetId hid(did);
-		unrolled[linear].valid=true;
-		unrolled[linear].ieta=hid.ieta();
-		unrolled[linear].iphi=hid.iphi();
-	      }
-	    } else {
-	      report.countUnmappedTPDigi(eid);
-	    }
-	  }
-
-	  if (unrolled[linear].valid) {
-	    if (isTPGSOI(*tp_work))          unrolled[linear].soi = unrolled[linear].samples;
-	    //    if (tp_work->raw() & (1<<ibit))  unrolled[linear].setbit(unrolled[linear].samples);
-	    unrolled[linear].samples++;
-	  }
-
-	} //for (int ibit=0; ibit<8; ibit++)
-      } // for (tp_work=tp_begin; tp_work!=tp_end; tp_work++) 
-
-    } //  if (isHOtpg) 
-  } //  for (int spigot=0; spigot<HcalDCCHeader::SPIGOT_COUNT; spigot++)
-} //unpack
-
 
 
 //define this as a plug-in
