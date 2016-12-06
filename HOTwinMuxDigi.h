@@ -3,20 +3,24 @@
 
 #include <boost/cstdint.hpp>
 #include <ostream>
-//#include "DataFormats/HcalDetId/interface/HcalDetId.h"
+#include "DataFormats/HcalDetId/interface/HcalDetId.h"
 
 /** \class HOTwinMuxDigi
   *  Simple container packer/unpacker for HO in TwinMUX
-  *  Trigger Primitive from an HO HTR, via oSLB links, to TwinMUX
+  *  Trigger Primitive from an HO HTR
   *
   *  \author Saxena, Pooja - DESY
   */
 
 class HOTwinMuxDigi {
  public:
+  typedef HcalDetId key_type; /// For the sorted collection
+
   HOTwinMuxDigi() {theTP_HO=0;}
   HOTwinMuxDigi(uint64_t data) {theTP_HO = data;}
   HOTwinMuxDigi(int ieta, int iphi, int mip, int sector, int wheel, int index, int link, bool validbit );
+
+  const HcalDetId id() const { return HcalDetId(HcalOuter,ieta(),iphi(),4); }
 
   /// get raw packed HO 
   uint64_t raw() const {return theTP_HO; }
